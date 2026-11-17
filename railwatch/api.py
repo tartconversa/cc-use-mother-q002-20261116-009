@@ -32,6 +32,10 @@ class SourceInput(StrictModel):
     expected_version: int | None = None
 
 
+class OriginInput(StrictModel):
+    url: str
+
+
 class CaptureInput(StrictModel):
     source_id: str
     external_id: str
@@ -42,6 +46,11 @@ class CaptureInput(StrictModel):
     body: str
     media_type: str = "text/html"
     metadata: dict = Field(default_factory=dict)
+    origin: OriginInput | None = None
+
+
+class OriginCorrectionInput(StrictModel):
+    origin: OriginInput | None = None
 
 
 class ReviewInput(StrictModel):
@@ -112,6 +121,10 @@ def create_app(db_path=None):
     @app.get("/captures/{capture_id}")
     def get_capture(capture_id: int):
         return service.capture(capture_id)
+
+    @app.post("/captures/{capture_id}/origin")
+    def correct_capture_origin(capture_id: int, body: OriginCorrectionInput):
+        return service.correct_origin(capture_id, body.model_dump())
 
     @app.get("/captures")
     def list_captures(source_id: str | None = None, state: str | None = None,

@@ -25,6 +25,10 @@ class Reports:
         kinds = self._kinds(kinds)
         scopes = self.service.scopes(project_key)
         selected, unresolved = self._filter(scopes, kinds, start, end)
+        for entry in unresolved:
+            if entry["conflict"]:
+                key = (entry["project_key"], entry["kind"], entry["metric"], entry["period"])
+                entry["origin_divergence"] = self.service.divergence(key)
         return self._summarize(selected, unresolved, "current")
 
     def snapshot(self, snapshot_id, project_key=None, kinds=None, start=None, end=None):
@@ -92,7 +96,12 @@ class Reports:
                                      "claim_id": claim["claim_id"]})
             provenance.append({"claim_id": claim["claim_id"], "project_key": scope["project_key"],
                                "period": scope["period"], "source_id": claim["source_id"],
-                               "url": claim["url"], "quote": claim["quote"]})
+                               "url": claim["url"], "quote": claim["quote"],
+                               "relation": claim.get("relation", "original"),
+                               "origin_url": claim.get("origin_url"),
+                               "origin_source_id": claim.get("origin_source_id"),
+                               "origin_key": claim.get("origin_key"),
+                               "corroboration": scope.get("corroboration")})
         series = []
         for (project, kind, metric, unit), values in sorted(numeric.items()):
             values.sort(key=lambda value: value["period"])

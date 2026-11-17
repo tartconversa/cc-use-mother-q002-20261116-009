@@ -119,6 +119,20 @@ class SourcePolicy:
 
 
 @dataclass(frozen=True)
+class Origin:
+    """铁路新闻证据系统：Declared original location of a republished release."""
+    url: str
+
+    @classmethod
+    def parse(cls, value):
+        if value is None:
+            return None
+        if not isinstance(value, dict) or set(value) - {"url"}:
+            raise ProductError("invalid_origin", "origin must be an object with a url")
+        return cls(url(value.get("url")))
+
+
+@dataclass(frozen=True)
 class Capture:
     source_id: str
     external_id: str
@@ -129,6 +143,7 @@ class Capture:
     body: str
     media_type: str
     metadata: dict
+    origin: Origin | None = None
 
     @classmethod
     def parse(cls, value):
@@ -142,7 +157,8 @@ class Capture:
             raise ProductError("invalid_media", "unsupported media type")
         return cls(token(value.get("source_id"), "source_id"), token(value.get("external_id"), "external_id"),
                    url(value.get("url")), instant(value.get("fetched_at")), instant(value.get("published_at")),
-                   text(value.get("title"), "title", 500), text(value.get("body"), "body"), media_type, metadata)
+                   text(value.get("title"), "title", 500), text(value.get("body"), "body"), media_type, metadata,
+                   Origin.parse(value.get("origin")))
 
     def check(self, policy):
         if self.source_id != policy.source_id or urlsplit(self.url).hostname != policy.host:

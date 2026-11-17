@@ -23,6 +23,8 @@ CREATE TABLE IF NOT EXISTS captures (
  published_at TEXT NOT NULL, title TEXT NOT NULL, body TEXT NOT NULL,
  media_type TEXT NOT NULL, metadata_json TEXT NOT NULL, content_hash TEXT NOT NULL,
  state TEXT NOT NULL, policy_version INTEGER NOT NULL, created_at TEXT NOT NULL,
+ relation TEXT NOT NULL DEFAULT 'original', origin_url TEXT,
+ origin_source_id TEXT, origin_capture_id INTEGER, origin_key TEXT,
  UNIQUE(source_id,external_id,content_hash)
 );
 CREATE INDEX IF NOT EXISTS captures_identity ON captures(source_id,external_id,id);
@@ -57,6 +59,14 @@ CREATE TABLE IF NOT EXISTS audit (
 );
 """
 
+CAPTURE_PROVENANCE_COLUMNS = {
+    "relation": "TEXT NOT NULL DEFAULT 'original'",
+    "origin_url": "TEXT",
+    "origin_source_id": "TEXT",
+    "origin_capture_id": "INTEGER",
+    "origin_key": "TEXT",
+}
+
 
 def now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -79,6 +89,11 @@ class Store:
     def initialize(self):
         with closing(self.connect()) as db:
             db.executescript(SCHEMA)
+            existing = {row["name"] for row in db.execute("PRAGMA table_info(captures)")}
+            for column, definition in CAPTURE_PROVENANCE_COLUMNS.items():
+                if column not in existing:
+                    db.execute(f"ALTER TABLE captures ADD COLUMN {column} {definition}")
+            db.execute("CREATE INDEX IF NOT EXISTS captures_origin ON captures(origin_key)")
 
     @contextmanager
     def transaction(self):
@@ -111,6 +126,14 @@ class Store:
         row = self.one("SELECT * FROM sources WHERE source_id=?", (source_id,))
         if row is None:
             raise ProductError("unknown_source", "source is not registered", 404)
+        row["kinds"] = json.loads(row.pop("kinds_json"))
+        row["active"] = bool(row["active"])
+        return row
+
+    def source_by_host(self, host):
+        row = self.one("SELECT * FROM sources WHERE host=?", (host,))
+        if row is None:
+            return None
         row["kinds"] = json.loads(row.pop("kinds_json"))
         row["active"] = bool(row["active"])
         return row
@@ -148,7 +171,11 @@ class Store:
         return self.all("SELECT id,content_hash,state,policy_version FROM captures WHERE source_id=? AND external_id=? ORDER BY id",
                         (source_id, external_id))
 
-    def put_capture(self, item, policy):
+    def capture_by_url(self, source_id, url):
+        return self.one("SELECT id,external_id,state FROM captures WHERE source_id=? AND url=? ORDER BY id DESC LIMIT 1",
+                        (source_id, url))
+
+    def put_capture(self, item, policy, provenance):
         with self.transaction() as db:
             duplicate = db.execute("SELECT id FROM captures WHERE source_id=? AND external_id=? AND content_hash=?",
                                    (item.source_id, item.external_id, item.content_hash())).fetchone()
@@ -165,15 +192,35 @@ class Store:
                 db.execute("UPDATE claims SET state='retracted' WHERE capture_id=? AND state='accepted'", (old_id,))
             db.execute("UPDATE captures SET state='superseded' WHERE source_id=? AND external_id=? AND state!='superseded'",
                        (item.source_id, item.external_id))
-            cursor = db.execute("INSERT INTO captures(source_id,external_id,url,fetched_at,published_at,title,body,media_type,metadata_json,content_hash,state,policy_version,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            cursor = db.execute("INSERT INTO captures(source_id,external_id,url,fetched_at,published_at,title,body,media_type,metadata_json,content_hash,state,policy_version,created_at,relation,origin_url,origin_source_id,origin_capture_id,origin_key) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                                 (item.source_id, item.external_id, item.url, item.fetched_at, item.published_at,
                                  item.title, item.body, item.media_type, canonical(item.metadata), item.content_hash(),
-                                 "received", policy.version, now()))
+                                 "received", policy.version, now(), provenance["relation"], provenance["origin_url"],
+                                 provenance["origin_source_id"], provenance["origin_capture_id"], provenance["origin_key"]))
             capture_id = cursor.lastrowid
-            self.audit(db, "capture_received", str(capture_id), {"identity": item.identity(), "hash": item.content_hash()})
+            self.audit(db, "capture_received", str(capture_id),
+                       {"identity": item.identity(), "hash": item.content_hash(),
+                        "relation": provenance["relation"], "origin_key": provenance["origin_key"]})
             if old_ids:
                 self.audit(db, "capture_superseded", str(capture_id), {"old_capture_ids": old_ids})
+            linked = db.execute("UPDATE captures SET origin_capture_id=? WHERE origin_url=? AND origin_capture_id IS NULL",
+                                (capture_id, item.url)).rowcount
+            if linked:
+                self.audit(db, "origin_links_resolved", str(capture_id), {"linked_republications": linked})
             return capture_id, True
+
+    def update_origin(self, capture_id, provenance):
+        with self.transaction() as db:
+            row = db.execute("SELECT relation,origin_url,origin_source_id,origin_capture_id,origin_key FROM captures WHERE id=?",
+                             (capture_id,)).fetchone()
+            if row is None:
+                raise ProductError("unknown_capture", "capture does not exist", 404)
+            before = dict(row)
+            db.execute("UPDATE captures SET relation=?,origin_url=?,origin_source_id=?,origin_capture_id=?,origin_key=? WHERE id=?",
+                       (provenance["relation"], provenance["origin_url"], provenance["origin_source_id"],
+                        provenance["origin_capture_id"], provenance["origin_key"], capture_id))
+            self.audit(db, "capture_origin_corrected", str(capture_id), {"before": before, "after": provenance})
+        return self.capture(capture_id)
 
     def set_capture_state(self, capture_id, expected, target, detail):
         with self.transaction() as db:
@@ -214,7 +261,10 @@ class Store:
         return row
 
     def candidates(self, key):
-        return self.all("SELECT c.*,s.trust_rank,a.published_at,a.state AS capture_state FROM claims c JOIN captures a ON a.id=c.capture_id JOIN sources s ON s.source_id=a.source_id WHERE c.project_key=? AND c.kind=? AND c.metric=? AND c.period=? ORDER BY c.id", key)
+        return self.all("SELECT c.*,s.trust_rank,a.source_id,a.url AS capture_url,a.published_at,a.state AS capture_state,"
+                        "a.relation,a.origin_url,a.origin_source_id,a.origin_capture_id,a.origin_key "
+                        "FROM claims c JOIN captures a ON a.id=c.capture_id JOIN sources s ON s.source_id=a.source_id "
+                        "WHERE c.project_key=? AND c.kind=? AND c.metric=? AND c.period=? ORDER BY c.id", key)
 
     def record_review(self, claim_id, decision, reviewer, reason, expected_version, selected, conflict):
         claim = self.claim(claim_id)
